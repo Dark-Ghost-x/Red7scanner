@@ -1,0 +1,526 @@
+#!/usr/bin/env python3
+"""
+RED -Shai-Hulud-Detector-and-Scanner"""
+import json
+import xml.etree.ElementTree as ET
+import os
+import re
+import hashlib
+import subprocess
+import logging
+import zipfile
+import tarfile
+import tempfile
+import shutil
+from pathlib import Path
+from datetime import datetime
+import argparse
+import sys
+
+try:
+    from colorama import init, Fore, Back, Style
+    init()
+except ImportError:
+    class DummyColors:
+        RED = YELLOW = GREEN = CYAN = MAGENTA = WHITE = RESET = ""
+    Fore = Back = Style = DummyColors()
+
+# ASCII Art Logo
+RED_LOGO = f"""
+{Fore.RED}
+██████╗ ███████╗██████╗ 
+██╔══██╗██╔════╝██╔══██╗
+██████╔╝█████╗  ██║  ██║
+██╔══██╗██╔══╝  ██║  ██║
+██║  ██║███████╗██████╔╝
+╚═╝  ╚═╝╚══════╝╚═════╝ 
+{Style.RESET_ALL}
+Robust Evilware Detector v1
+Specialized Shai-Hulud v2 Worm Scanner
+"""
+
+class SecurityScanner:
+    def __init__(self):
+        self.setup_logging()
+        self.suspicious_patterns = {
+            'npm_scripts': [
+                r"preinstall.*\b(curl|wget|powershell).*http",
+                r"postinstall.*\b(npm|node).*\.js",
+                r"install.*\b(eval|base64|decode)",
+                r"scripts.*http.*\.(sh|bat|ps1)",
+                r"prepare.*\b(exec|spawn|fork)",
+                r"shai.?hulud",
+                r"worm|malware|malicious",
+                r"http://\d+\.\d+\.\d+\.\d+",
+                r"https?://[^\s]*\.(tk|ml|ga|cf|xyz)",
+                r"require\(['\"]child_process['\"]\)",
+                r"execSync|spawnSync",
+                r"os\.system|subprocess\.call"
+            ],
+            'maven_repos': [
+                r"<repository>.*http://\d+\.\d+\.\d+\.\d+",
+                r"<url>http://[^<]*malicious",
+                r"shai.?hulud",
+                r"<dependency>.*\b(test|fake|malware)\b"
+            ],
+            'docker_commands': [
+                r"RUN.*\b(curl|wget).*http.*\|.*(sh|bash)",
+                r"RUN.*npm.*install.*http",
+                r"FROM.*suspicious.*image",
+                r"ENV.*(TOKEN|KEY|SECRET).*="
+            ],
+            'github_actions': [
+                r"uses:.*http://",
+                r"run:.*curl.*http",
+                r"env:.*\b(TOKEN|KEY|SECRET)\b",
+                r"with:.*token.*http"
+            ],
+            'env_secrets': [
+                r"(API_KEY|SECRET|TOKEN|PASSWORD)=[^\s]+",
+                r"AWS_ACCESS_KEY_ID=.*",
+                r"AWS_SECRET_ACCESS_KEY=.*",
+                r"GITHUB_TOKEN=.*"
+            ]
+        }
+        
+        self.suspicious_files = [
+            "install.js", "preinstall.js", "postinstall.js", 
+            "setup.js", "init.js", "bootstrap.js", "update.js"
+        ]
+        
+        self.suspicious_dirs = [
+            "node_modules", "target", "build", "dist",
+            ".github/workflows", "scripts", "bin", "tools"
+        ]
+        
+        self.known_malicious_hashes = set()
+
+    def setup_logging(self):
+        """Setup comprehensive logging system"""
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(f'red_scanner_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'),
+                logging.StreamHandler()
+            ]
+        )
+        self.logger = logging.getLogger('RED_Scanner')
+
+    def safe_execute(self, func, *args, **kwargs):
+        """Safely execute functions with error handling"""
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            self.logger.error(f"Error in {func.__name__}: {str(e)}")
+            return None
+
+    def calculate_file_hash(self, file_path):
+        """Calculate SHA256 hash of file"""
+        try:
+            hasher = hashlib.sha256()
+            with open(file_path, 'rb') as f:
+                for chunk in iter(lambda: f.read(4096), b""):
+                    hasher.update(chunk)
+            return hasher.hexdigest()
+        except Exception as e:
+            self.logger.warning(f"Could not calculate hash for {file_path}: {e}")
+            return None
+
+    def scan_npm_project(self, project_path):
+        """Scan NPM projects for suspicious patterns"""
+        findings = []
+        package_json = Path(project_path) / "package.json"
+        
+        if package_json.exists():
+            self.logger.info(f"Scanning NPM project: {project_path}")
+            
+            package_data = self.safe_execute(json.loads, package_json.read_text(encoding='utf-8'))
+            if not package_data:
+                return findings
+
+            # Scan package.json scripts
+            scripts = package_data.get('scripts', {})
+            for script_name, script_content in scripts.items():
+                for pattern in self.suspicious_patterns['npm_scripts']:
+                    if re.search(pattern, script_content, re.IGNORECASE):
+                        risk_level = "HIGH" if "curl" in script_content or "wget" in script_content else "MEDIUM"
+                        findings.append({
+                            "file": str(package_json),
+                            "risk": risk_level,
+                            "type": "suspicious_script",
+                            "details": f"Suspicious script '{script_name}': {script_content}",
+                            "pattern": pattern
+                        })
+
+            # Scan dependencies
+            all_deps = {
+                **package_data.get('dependencies', {}),
+                **package_data.get('devDependencies', {}),
+                **package_data.get('optionalDependencies', {})
+            }
+            
+            for dep_name in all_deps.keys():
+                if any(suspicious in dep_name.lower() for suspicious in ['shai', 'hulud', 'worm', 'test-package', 'malicious']):
+                    findings.append({
+                        "file": str(package_json),
+                        "risk": "HIGH",
+                        "type": "suspicious_dependency",
+                        "details": f"Suspicious dependency: {dep_name}",
+                        "pattern": "known_malicious_package"
+                    })
+
+        return findings
+
+    def scan_maven_project(self, project_path):
+        """Scan Maven projects for malicious repositories and dependencies"""
+        findings = []
+        pom_xml = Path(project_path) / "pom.xml"
+        
+        if pom_xml.exists():
+            self.logger.info(f"Scanning Maven project: {project_path}")
+            
+            try:
+                tree = ET.parse(pom_xml)
+                root = tree.getroot()
+                
+                # Scan repositories
+                namespaces = {'maven': 'http://maven.apache.org/POM/4.0.0'}
+                for repo in root.findall('.//maven:repository', namespaces):
+                    url_elem = repo.find('maven:url', namespaces)
+                    if url_elem is not None and url_elem.text:
+                        repo_url = url_elem.text
+                        for pattern in self.suspicious_patterns['maven_repos']:
+                            if re.search(pattern, repo_url, re.IGNORECASE):
+                                findings.append({
+                                    "file": str(pom_xml),
+                                    "risk": "HIGH",
+                                    "type": "malicious_repository",
+                                    "details": f"Malicious repository URL: {repo_url}",
+                                    "pattern": pattern
+                                })
+                
+                # Scan dependencies
+                for dep in root.findall('.//maven:dependency', namespaces):
+                    group_id = dep.find('maven:groupId', namespaces)
+                    artifact_id = dep.find('maven:artifactId', namespaces)
+                    
+                    if group_id is not None and artifact_id is not None:
+                        dep_name = f"{group_id.text}:{artifact_id.text}"
+                        if any(suspicious in dep_name.lower() for suspicious in ['shai', 'hulud', 'test', 'fake']):
+                            findings.append({
+                                "file": str(pom_xml),
+                                "risk": "HIGH",
+                                "type": "suspicious_dependency",
+                                "details": f"Suspicious Maven dependency: {dep_name}",
+                                "pattern": "known_malicious_dependency"
+                            })
+                            
+            except Exception as e:
+                self.logger.error(f"Error parsing pom.xml: {e}")
+
+        return findings
+
+    def scan_docker_files(self, project_path):
+        """Scan Dockerfile and docker-compose.yml"""
+        findings = []
+        
+        for docker_file in ["Dockerfile", "docker-compose.yml"]:
+            file_path = Path(project_path) / docker_file
+            if file_path.exists():
+                self.logger.info(f"Scanning Docker file: {docker_file}")
+                
+                try:
+                    content = file_path.read_text(encoding='utf-8')
+                    
+                    if docker_file == "Dockerfile":
+                        for pattern in self.suspicious_patterns['docker_commands']:
+                            matches = re.findall(pattern, content, re.IGNORECASE)
+                            for match in matches:
+                                findings.append({
+                                    "file": str(file_path),
+                                    "risk": "HIGH",
+                                    "type": "suspicious_docker_command",
+                                    "details": f"Suspicious Docker command: {match}",
+                                    "pattern": pattern
+                                })
+                    
+                    elif docker_file == "docker-compose.yml":
+                        # Basic pattern matching for docker-compose
+                        suspicious_lines = re.findall(r"image:.*suspicious|build:.*http", content, re.IGNORECASE)
+                        for line in suspicious_lines:
+                            findings.append({
+                                "file": str(file_path),
+                                "risk": "MEDIUM",
+                                "type": "suspicious_compose_config",
+                                "details": f"Suspicious docker-compose line: {line}",
+                                "pattern": "suspicious_image_or_build"
+                            })
+                            
+                except Exception as e:
+                    self.logger.error(f"Error reading {docker_file}: {e}")
+
+        return findings
+
+    def scan_github_workflows(self, project_path):
+        """Scan GitHub Actions workflows"""
+        findings = []
+        workflows_path = Path(project_path) / ".github" / "workflows"
+        
+        if workflows_path.exists():
+            for workflow_file in workflows_path.glob("*.yml"):
+                self.logger.info(f"Scanning GitHub workflow: {workflow_file}")
+                
+                try:
+                    content = workflow_file.read_text(encoding='utf-8')
+                    
+                    for pattern in self.suspicious_patterns['github_actions']:
+                        matches = re.findall(pattern, content, re.IGNORECASE)
+                        for match in matches:
+                            findings.append({
+                                "file": str(workflow_file),
+                                "risk": "HIGH",
+                                "type": "suspicious_workflow",
+                                "details": f"Suspicious workflow content: {match}",
+                                "pattern": pattern
+                            })
+                            
+                except Exception as e:
+                    self.logger.error(f"Error reading workflow file {workflow_file}: {e}")
+
+        return findings
+
+    def scan_environment_files(self, project_path):
+        """Scan environment and shell configuration files"""
+        findings = []
+        env_files = [".env", ".bashrc", ".zshrc", ".profile"]
+        
+        for env_file in env_files:
+            file_path = Path(project_path) / env_file
+            if file_path.exists():
+                self.logger.info(f"Scanning environment file: {env_file}")
+                
+                try:
+                    content = file_path.read_text(encoding='utf-8')
+                    
+                    for pattern in self.suspicious_patterns['env_secrets']:
+                        matches = re.findall(pattern, content)
+                        for match in matches:
+                            # Only flag if it looks like actual exposed secrets
+                            if len(match.split('=')[1]) > 5:  # Basic length check for actual values
+                                findings.append({
+                                    "file": str(file_path),
+                                    "risk": "CRITICAL",
+                                    "type": "exposed_secret",
+                                    "details": f"Potential exposed secret: {match.split('=')[0]}",
+                                    "pattern": "exposed_credential"
+                                })
+                            
+                except Exception as e:
+                    self.logger.error(f"Error reading {env_file}: {e}")
+
+        return findings
+
+    def scan_suspicious_files(self, project_path):
+        """Scan for suspicious executable files"""
+        findings = []
+        
+        for suspicious_file in self.suspicious_files:
+            for file_path in Path(project_path).rglob(suspicious_file):
+                self.logger.info(f"Found suspicious file: {file_path}")
+                
+                try:
+                    content = file_path.read_text(encoding='utf-8', errors='ignore')
+                    
+                    # Check for obfuscated or malicious code
+                    suspicious_indicators = [
+                        "eval(", "base64", "decode", "child_process",
+                        "execSync", "require('http')", "process.exit"
+                    ]
+                    
+                    for indicator in suspicious_indicators:
+                        if indicator in content:
+                            findings.append({
+                                "file": str(file_path),
+                                "risk": "HIGH",
+                                "type": "suspicious_script",
+                                "details": f"Suspicious code pattern: {indicator}",
+                                "pattern": "malicious_code_pattern"
+                            })
+                            
+                except Exception as e:
+                    self.logger.warning(f"Could not read {file_path}: {e}")
+
+        return findings
+
+    def extract_archive(self, archive_path, extract_to):
+        """Extract zip or tar archives safely"""
+        try:
+            if zipfile.is_zipfile(archive_path):
+                with zipfile.ZipFile(archive_path, 'r') as zip_ref:
+                    zip_ref.extractall(extract_to)
+                return True
+            elif tarfile.is_tarfile(archive_path):
+                with tarfile.open(archive_path, 'r:*') as tar_ref:
+                    tar_ref.extractall(extract_to)
+                return True
+            else:
+                self.logger.error(f"Unsupported archive format: {archive_path}")
+                return False
+        except Exception as e:
+            self.logger.error(f"Error extracting archive {archive_path}: {e}")
+            return False
+
+    def clone_repository(self, repo_url, clone_to):
+        """Safely clone git repository"""
+        try:
+            result = subprocess.run(
+                ['git', 'clone', repo_url, clone_to],
+                capture_output=True,
+                text=True,
+                timeout=300,
+                shell=False  # Critical for security
+            )
+            return result.returncode == 0
+        except subprocess.TimeoutExpired:
+            self.logger.error("Git clone timeout")
+            return False
+        except Exception as e:
+            self.logger.error(f"Error cloning repository: {e}")
+            return False
+
+    def comprehensive_scan(self, target_path):
+        """Perform comprehensive security scan"""
+        all_findings = []
+        
+        scan_methods = [
+            self.scan_npm_project,
+            self.scan_maven_project,
+            self.scan_docker_files,
+            self.scan_github_workflows,
+            self.scan_environment_files,
+            self.scan_suspicious_files
+        ]
+        
+        for method in scan_methods:
+            findings = self.safe_execute(method, target_path)
+            if findings:
+                all_findings.extend(findings)
+        
+        return all_findings
+
+    def generate_report(self, findings, output_format="console"):
+        """Generate comprehensive security report"""
+        if output_format == "json":
+            report = {
+                "scan_date": datetime.now().isoformat(),
+                "total_findings": len(findings),
+                "findings": findings,
+                "summary": {
+                    "critical": len([f for f in findings if f["risk"] == "CRITICAL"]),
+                    "high": len([f for f in findings if f["risk"] == "HIGH"]),
+                    "medium": len([f for f in findings if f["risk"] == "MEDIUM"]),
+                    "low": len([f for f in findings if f["risk"] == "LOW"])
+                }
+            }
+            return json.dumps(report, indent=2)
+        
+        else:  # console output
+            report_lines = []
+            report_lines.append(f"\n{Fore.RED}=== RED SCAN REPORT ==={Style.RESET_ALL}")
+            report_lines.append(f"Scan Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            report_lines.append(f"Total Findings: {len(findings)}")
+            
+            risk_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
+            for finding in findings:
+                risk_counts[finding["risk"]] += 1
+            
+            for risk, count in risk_counts.items():
+                color = Fore.RED if risk in ["CRITICAL", "HIGH"] else Fore.YELLOW
+                report_lines.append(f"{color}{risk}: {count}{Style.RESET_ALL}")
+            
+            # Detailed findings
+            for finding in findings:
+                color = Fore.RED if finding["risk"] in ["CRITICAL", "HIGH"] else Fore.YELLOW
+                report_lines.append(f"\n{color}[{finding['risk']}] {finding['file']}{Style.RESET_ALL}")
+                report_lines.append(f"Type: {finding['type']}")
+                report_lines.append(f"Details: {finding['details']}")
+            
+            return "\n".join(report_lines)
+
+def main():
+    print(RED_LOGO)
+    
+    parser = argparse.ArgumentParser(description="RED - Robust Evilware Detector")
+    parser.add_argument("--path", help="Directory path to scan")
+    parser.add_argument("--file", help="Archive file to scan (zip, tar.gz)")
+    parser.add_argument("--repo", help="Git repository URL to scan")
+    
+    args = parser.parse_args()
+    
+    scanner = SecurityScanner()
+    scanner.logger.info("RED Scanner started")
+    
+    target_path = None
+    temp_dir = None
+    
+    try:
+        if args.path:
+            target_path = args.path
+            scanner.logger.info(f"Scanning directory: {target_path}")
+            
+        elif args.file:
+            scanner.logger.info(f"Extracting and scanning archive: {args.file}")
+            temp_dir = tempfile.mkdtemp()
+            if scanner.extract_archive(args.file, temp_dir):
+                target_path = temp_dir
+            else:
+                scanner.logger.error("Failed to extract archive")
+                return 1
+                
+        elif args.repo:
+            scanner.logger.info(f"Cloning and scanning repository: {args.repo}")
+            temp_dir = tempfile.mkdtemp()
+            if scanner.clone_repository(args.repo, temp_dir):
+                target_path = temp_dir
+            else:
+                scanner.logger.error("Failed to clone repository")
+                return 1
+        else:
+            # Default to current directory
+            target_path = "."
+            scanner.logger.info("Scanning current directory")
+        
+        if not target_path or not Path(target_path).exists():
+            scanner.logger.error("Target path does not exist")
+            return 1
+        
+        # Perform comprehensive scan
+        findings = scanner.comprehensive_scan(target_path)
+        
+        # Generate and display report
+        report = scanner.generate_report(findings)
+        print(report)
+        
+        # Save JSON report
+        json_report = scanner.generate_report(findings, "json")
+        report_filename = f"red_scan_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        with open(report_filename, 'w') as f:
+            f.write(json_report)
+        
+        scanner.logger.info(f"Detailed report saved to: {report_filename}")
+        
+        # Return exit code based on findings
+        critical_findings = len([f for f in findings if f["risk"] in ["CRITICAL", "HIGH"]])
+        return 1 if critical_findings > 0 else 0
+        
+    except Exception as e:
+        scanner.logger.error(f"Scanning failed: {e}")
+        return 1
+    finally:
+        # Cleanup temporary directories
+        if temp_dir and Path(temp_dir).exists():
+            shutil.rmtree(temp_dir)
+
+if __name__ == "__main__":
+    sys.exit(main())
